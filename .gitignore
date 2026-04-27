@@ -1,0 +1,5 @@
+.env
+text.txt
+uploads/__pycache__/app.cpython-314.pyc
+uploads/__pycache__/engine.cpython-314.pyc
+__pycache__/app.cpython-314.pyc
