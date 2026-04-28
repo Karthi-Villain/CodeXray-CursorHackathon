@@ -1,5 +1,21 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+
+# --- Secrets / local config ---
 .env
 text.txt
-uploads/__pycache__/app.cpython-314.pyc
-uploads/__pycache__/engine.cpython-314.pyc
-__pycache__/app.cpython-314.pyc
+
+# --- Runtime artifacts (regenerated on each run) ---
+uploads/
+generated_tests/
+
+# --- Hackathon PPT generation (deck + helpers + screenshots) ---
+# These are local presentation assets, not part of the app.
+HVS_CodeXray_CursorHackathon.pptx
+generate_ppt.py
+make_ppt.py
+take_screenshots.py
+demo_screenshots.py
+screenshots/

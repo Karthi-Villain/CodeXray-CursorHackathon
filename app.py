@@ -18,12 +18,13 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -46,6 +47,49 @@ CURSOR_REPO_URL = os.getenv(
 CURSOR_MODEL = os.getenv("CURSOR_MODEL", "default").strip() or "default"
 CURSOR_TIMEOUT_SECONDS = int(os.getenv("CURSOR_TIMEOUT_SECONDS", "120"))
 CURSOR_BASE_URL = "https://api.cursor.com"
+
+
+def _resolve_bin_with_source(
+    env_var: str, exe_name: str
+) -> tuple[str | None, str | None]:
+    """Return ``(path, source)`` for a runner executable.
+
+    Resolution order, designed so users can deploy on machines where the JDK
+    or Node aren't on PATH:
+
+    1. The env var (e.g. JAVA_BIN, NODE_BIN) — whitespace and surrounding
+       quotes are stripped, and the path is validated to exist. Reports the
+       env-var name as ``source`` only when it actually contributes the path.
+    2. ``shutil.which(exe_name)`` — anything on PATH. Source = ``"PATH"``.
+    3. ``(None, None)`` — caller surfaces a helpful error.
+    """
+
+    raw = (os.getenv(env_var) or "").strip().strip('"').strip("'")
+    if raw:
+        if os.path.isdir(raw):
+            for candidate_name in (exe_name, exe_name + ".exe"):
+                for sub in ("bin", "."):
+                    candidate = os.path.normpath(os.path.join(raw, sub, candidate_name))
+                    if os.path.isfile(candidate):
+                        return candidate, env_var
+        elif os.path.isfile(raw):
+            return raw, env_var
+        # Env var set but didn't resolve — fall through to PATH.
+
+    on_path = shutil.which(exe_name)
+    if on_path:
+        return on_path, "PATH"
+    return None, None
+
+
+def _resolve_bin(env_var: str, exe_name: str) -> str | None:
+    """Back-compat wrapper that returns just the resolved path."""
+    path, _ = _resolve_bin_with_source(env_var, exe_name)
+    return path
+
+
+JAVA_BIN_ENV = "JAVA_BIN"
+NODE_BIN_ENV = "NODE_BIN"
 
 REPORTS: dict[str, dict[str, Any]] = {}
 
@@ -195,7 +239,7 @@ applicable):
         "description": "<what this test verifies>",
         "inputs": "<concrete sample inputs>",
         "expected": "<expected behaviour or output>",
-        "pytest_code": "<self-contained pytest code if language is python, otherwise empty string>"
+        "test_code": "<self-contained test snippet in the runner appropriate for the language; see rules below. Empty string if the language is not python/javascript/typescript/java>"
       }}
     ],
     "edge":     [ /* same shape, boundary/edge conditions */ ],
@@ -289,7 +333,9 @@ Detection rules:
 - Always include `before` / `after` snippets that are short (<= 30 lines) and
   syntactically valid in the source language.
 
-Rules for `pytest_code` (only when language is python):
+Rules for `test_code`:
+
+When language is **python**:
 - Each entry must be a complete `def test_<name>(): ...` function.
 - Assume the uploaded module is importable as `{module_name}` (it is on sys.path).
 - Use only stdlib + pytest + unittest.mock. Do not require network access or external services.
@@ -303,6 +349,30 @@ Rules for `pytest_code` (only when language is python):
     on real external state.
 - Wrap calls that may legitimately raise in `pytest.raises(...)`.
 - Keep each test independent; no shared state.
+
+When language is **javascript** or **typescript**:
+- Each entry must be a single statement of the form
+  `test('test_<name>', () => {{ /* assertions using assert from node:assert */ }});`
+  (or the async variant `test('...', async () => {{...}})` if needed).
+- The harness will prepend `import {{ test }} from 'node:test'; import assert from 'node:assert/strict';`
+  and `import * as target from './{module_name}.mjs';` for you. Reference the uploaded
+  module's exports as `target.<exportName>`.
+- Stick to the standard library (node: builtins) and `assert`. Do not `require`
+  any third-party packages — they will not be installed in the runner.
+- Tests must be deterministic: no real network calls, no filesystem writes outside
+  the cwd, no `setTimeout`/`setInterval` longer than a few ms.
+- Keep each test independent; do not share state across tests.
+
+When language is **java**:
+- Each entry must be a complete `public static void test_<name>() throws Exception {{ ... }}`
+  static method. Do NOT include `@Test` annotations — the runner uses reflection.
+- The harness compiles a single file with your tests appended to the uploaded source,
+  inside a wrapper class. Reference top-level classes/methods directly (they are in
+  the same compilation unit). Use `org.junit`/`junit5` ONLY if the uploaded file
+  itself imports them — otherwise stick to plain `assert` / `if (...) throw new AssertionError(...)`.
+- Use only `java.*`, `javax.*` standard library. No Maven/Gradle deps.
+- Keep each test method self-contained; the runner invokes them one at a time and
+  reports `PASSED`/`FAILED` per method.
 
 Provide:
 - 2-4 cases per test category.
@@ -458,7 +528,8 @@ def build_pytest_file(
     seen: set[str] = set()
     for category in ("functional", "edge", "negative"):
         for case in test_cases.get(category, []) or []:
-            snippet = _normalise_pytest_code(case.get("pytest_code") or "")
+            raw = case.get("test_code") or case.get("pytest_code") or ""
+            snippet = _normalise_pytest_code(raw)
             if not snippet or "def test_" not in snippet:
                 continue
             name_match = re.search(r"def\s+(test_[A-Za-z0-9_]+)\s*\(", snippet)
@@ -580,6 +651,392 @@ def run_pytest(test_file_path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Node.js test runner (JavaScript / TypeScript)
+# ---------------------------------------------------------------------------
+
+
+_NODE_TAP_TEST = re.compile(r"^(ok|not ok)\s+\d+\s+-\s+(.+?)(?:\s+#.*)?$", re.MULTILINE)
+_NODE_TAP_SUMMARY = re.compile(
+    r"^# (tests|pass|fail|cancelled|skipped|todo|duration_ms)\s+(\S+)$",
+    re.MULTILINE,
+)
+
+
+def _is_ts(language: str) -> bool:
+    return language in ("typescript", "ts")
+
+
+def build_node_test_file(
+    module_name: str, test_cases: dict[str, Any], language: str
+) -> str:
+    """Combine AI-generated `test('...', () => {...})` snippets into one .mjs file.
+
+    The harness imports `node:test` + `node:assert/strict` and the uploaded
+    module under the alias `target`. The ESM `import` in the harness is what
+    forces us to write the uploaded file as `.mjs` even if it was uploaded
+    as plain `.js`.
+    """
+
+    ext = "mts" if _is_ts(language) else "mjs"
+    parts: list[str] = [
+        "import { test } from 'node:test';",
+        "import assert from 'node:assert/strict';",
+        f"// Uploaded module is sibling-imported as 'target'",
+        f"import * as target from './{module_name}.{ext}';",
+        "",
+        "test('module_imports', () => {",
+        "  assert.ok(target, 'uploaded module did not load');",
+        "});",
+        "",
+    ]
+
+    seen: set[str] = set()
+    for category in ("functional", "edge", "negative"):
+        for case in test_cases.get(category, []) or []:
+            raw = case.get("test_code") or case.get("pytest_code") or ""
+            snippet = _normalise_pytest_code(raw)
+            if not snippet:
+                continue
+            name_match = re.search(
+                r"test\s*\(\s*['\"`]([^'\"`]+)['\"`]", snippet
+            )
+            if not name_match:
+                continue
+            base = name_match.group(1)
+            unique = base
+            counter = 1
+            while unique in seen:
+                counter += 1
+                unique = f"{base}_{counter}"
+            seen.add(unique)
+            if unique != base:
+                snippet = snippet.replace(
+                    name_match.group(0),
+                    name_match.group(0).replace(base, unique, 1),
+                    1,
+                )
+            parts.append(f"// --- {category}: {case.get('name', unique)} ---")
+            parts.append(snippet)
+            parts.append("")
+
+    return "\n".join(parts) + "\n"
+
+
+def _parse_node_tap(stdout: str) -> tuple[list[dict[str, str]], dict[str, int]]:
+    tests: list[dict[str, str]] = []
+    for ok, name in _NODE_TAP_TEST.findall(stdout):
+        tests.append(
+            {
+                "name": name.strip(),
+                "status": "PASSED" if ok == "ok" else "FAILED",
+            }
+        )
+    counters: dict[str, int] = {}
+    for key, val in _NODE_TAP_SUMMARY.findall(stdout):
+        try:
+            counters[key] = int(val)
+        except ValueError:
+            continue
+    return tests, counters
+
+
+def run_node_test(test_file_path: str) -> dict[str, Any]:
+    """Run `node --test --test-reporter=tap` against the generated .mjs file."""
+
+    node = _resolve_bin(NODE_BIN_ENV, "node")
+    if not node:
+        return {
+            "ran": False,
+            "error": (
+                "Node executable not found. Install Node.js 20+ and either add "
+                "it to PATH, or set NODE_BIN in your .env to the absolute path "
+                "of node.exe (or the Node install directory)."
+            ),
+            "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "total": 0,
+            "tests": [], "stdout": "", "exit_code": -1,
+        }
+
+    abs_path = os.path.abspath(test_file_path)
+    cwd = os.path.dirname(abs_path)
+    try:
+        result = subprocess.run(
+            [node, "--test", "--test-reporter=tap", os.path.basename(abs_path)],
+            capture_output=True, text=True, timeout=60,
+            cwd=cwd,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ran": True, "timeout": True,
+            "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "total": 0,
+            "tests": [],
+            "stdout": "Test execution timed out after 60 seconds.",
+            "exit_code": -1,
+        }
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    combined = stdout + ("\n" + stderr if stderr else "")
+
+    tests, counters = _parse_node_tap(stdout)
+    passed = counters.get("pass", sum(1 for t in tests if t["status"] == "PASSED"))
+    failed = counters.get("fail", sum(1 for t in tests if t["status"] == "FAILED"))
+    skipped = counters.get("skipped", 0)
+    total = counters.get("tests", len(tests))
+
+    summary_line = ""
+    if "tests" in counters or "pass" in counters or "fail" in counters:
+        summary_line = (
+            f"{counters.get('tests', total)} tests, "
+            f"{counters.get('pass', passed)} passed, "
+            f"{counters.get('fail', failed)} failed, "
+            f"{counters.get('skipped', skipped)} skipped"
+        )
+
+    return {
+        "ran": True, "timeout": False,
+        "passed": passed, "failed": failed, "errors": 0,
+        "skipped": skipped, "total": total,
+        "tests": tests,
+        "stdout": combined[-4000:],
+        "exit_code": result.returncode,
+        "summary_line": summary_line,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Java test runner (single-file source-code launcher, JEP 330)
+# ---------------------------------------------------------------------------
+
+
+_JAVA_RESULT_RE = re.compile(
+    r"^(PASSED|FAILED):([^:\r\n]+)(?::([^\r\n]*))?$", re.MULTILINE
+)
+
+
+_JAVA_PUBLIC_TOP_RE = re.compile(
+    r"(^|\n)\s*public\s+(class|interface|enum|record)\s+",
+)
+
+
+def _demote_public_top_level(source_code: str) -> str:
+    """JEP 330 forbids more than one `public` top-level type per .java file.
+
+    The runner class IS our public type, so any `public class` in the uploaded
+    source must become package-private. Tests are in the same compilation unit
+    so they can still reference these types directly.
+    """
+    return _JAVA_PUBLIC_TOP_RE.sub(lambda m: f"{m.group(1)}{m.group(2)} ", source_code)
+
+
+def build_java_test_file(
+    runner_class: str, test_cases: dict[str, Any], source_code: str
+) -> str:
+    """Build a single-file Java program that runs each AI-generated test method.
+
+    The runner class is appended to the uploaded source so generated tests can
+    call top-level types directly. JEP 330 (`java MyFile.java`) lets us skip
+    Maven/Gradle entirely.
+    """
+
+    snippets: list[str] = []
+    method_names: list[str] = []
+    seen: set[str] = set()
+
+    for category in ("functional", "edge", "negative"):
+        for case in test_cases.get(category, []) or []:
+            raw = case.get("test_code") or case.get("pytest_code") or ""
+            snippet = _normalise_pytest_code(raw)
+            if not snippet:
+                continue
+            m = re.search(
+                r"(public\s+static\s+void\s+)(test_[A-Za-z0-9_]+)\s*\(",
+                snippet,
+            )
+            if not m:
+                continue
+            base = m.group(2)
+            unique = base
+            counter = 1
+            while unique in seen:
+                counter += 1
+                unique = f"{base}_{counter}"
+            seen.add(unique)
+            if unique != base:
+                snippet = snippet.replace(base, unique, 1)
+            method_names.append(unique)
+            snippets.append(f"    // --- {category}: {case.get('name', unique)} ---")
+            snippets.append("    " + snippet.replace("\n", "\n    "))
+            snippets.append("")
+
+    invocations = "\n".join(
+        f'        runOne("{name}", () -> {runner_class}Tests.{name}());'
+        for name in method_names
+    )
+
+    methods_block = "\n".join(snippets) if snippets else "    // no tests"
+
+    sanitized_source = _demote_public_top_level(source_code)
+
+    return f"""// Auto-generated CodeXray Java test harness.
+// Uploaded source is appended below; its public top-level types are demoted
+// to package-private so JEP 330's single-public-type rule is respected.
+
+public class {runner_class} {{
+    interface TestFn {{ void run() throws Exception; }}
+
+    static int passed = 0;
+    static int failed = 0;
+
+    static void runOne(String name, TestFn fn) {{
+        try {{
+            fn.run();
+            System.out.println("PASSED:" + name);
+            passed++;
+        }} catch (Throwable t) {{
+            String msg = t.getClass().getSimpleName() + ": " +
+                (t.getMessage() == null ? "" : t.getMessage().replace('\\n', ' '));
+            System.out.println("FAILED:" + name + ":" + msg);
+            failed++;
+        }}
+    }}
+
+    public static void main(String[] args) {{
+        runOne("test_module_loads", () -> {{ /* class-load smoke test */ }});
+{invocations}
+        System.out.println("# tests " + (passed + failed));
+        System.out.println("# pass " + passed);
+        System.out.println("# fail " + failed);
+        if (failed > 0) System.exit(1);
+    }}
+}}
+
+class {runner_class}Tests {{
+{methods_block}
+}}
+
+// ---------------- uploaded source (public types demoted) ----------------
+{sanitized_source}
+"""
+
+
+def run_java_test(test_file_path: str) -> dict[str, Any]:
+    """Run a single-file Java program (JEP 330) and parse PASSED/FAILED lines."""
+
+    java = _resolve_bin(JAVA_BIN_ENV, "java")
+    if not java:
+        return {
+            "ran": False,
+            "error": (
+                "Java executable not found. Install JDK 11+ and either add it "
+                "to PATH, or set JAVA_BIN in your .env to either the JDK home "
+                "directory (e.g. C:/Program Files/Java/jdk-26.0.1) or the full "
+                "path to java.exe."
+            ),
+            "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "total": 0,
+            "tests": [], "stdout": "", "exit_code": -1,
+        }
+
+    abs_path = os.path.abspath(test_file_path)
+    cwd = os.path.dirname(abs_path)
+    try:
+        result = subprocess.run(
+            [java, os.path.basename(abs_path)],
+            capture_output=True, text=True, timeout=90,
+            cwd=cwd,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ran": True, "timeout": True,
+            "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "total": 0,
+            "tests": [],
+            "stdout": "Test execution timed out after 90 seconds.",
+            "exit_code": -1,
+        }
+
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+    combined = stdout + ("\n" + stderr if stderr else "")
+
+    tests: list[dict[str, str]] = []
+    for status, name, _ in _JAVA_RESULT_RE.findall(stdout):
+        tests.append({"name": name.strip(), "status": status})
+
+    passed = sum(1 for t in tests if t["status"] == "PASSED")
+    failed = sum(1 for t in tests if t["status"] == "FAILED")
+    total = len(tests)
+
+    compile_error = "error:" in stderr.lower() and result.returncode != 0 and not tests
+    errors = 1 if compile_error else 0
+
+    summary_line = (
+        f"{total} tests, {passed} passed, {failed} failed"
+        if tests
+        else (stderr.splitlines()[0] if stderr else "")
+    )
+
+    return {
+        "ran": True, "timeout": False,
+        "passed": passed, "failed": failed,
+        "errors": errors, "skipped": 0,
+        "total": total,
+        "tests": tests,
+        "stdout": combined[-4000:],
+        "exit_code": result.returncode,
+        "summary_line": summary_line,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test-runner dispatch
+# ---------------------------------------------------------------------------
+
+
+def _execute_tests(
+    *,
+    language: str,
+    module_name: str,
+    safe_module: str,
+    code: str,
+    test_cases: dict[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Pick the right runner for the language. Returns (test_run, test_file_path)."""
+
+    if not test_cases:
+        return None, None
+
+    if language == "python":
+        path = os.path.join(TEST_FOLDER, f"test_{safe_module}.py")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(build_pytest_file(safe_module, test_cases, code))
+        run = run_pytest(path)
+        return run, path
+
+    if language in ("javascript", "typescript"):
+        ext = "mts" if language == "typescript" else "mjs"
+        # write the uploaded source as a sibling .mjs/.mts so the harness can
+        # `import * as target from './<module>.mjs'`.
+        module_path = os.path.join(TEST_FOLDER, f"{safe_module}.{ext}")
+        with open(module_path, "w", encoding="utf-8") as fh:
+            fh.write(code)
+        path = os.path.join(TEST_FOLDER, f"test_{safe_module}.{ext}")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(build_node_test_file(safe_module, test_cases, language))
+        run = run_node_test(path)
+        return run, path
+
+    if language == "java":
+        # Wrapper class must be the file's basename per JEP 330.
+        runner_class = (safe_module[:1].upper() + safe_module[1:]) + "Runner"
+        path = os.path.join(TEST_FOLDER, f"{runner_class}.java")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(build_java_test_file(runner_class, test_cases, code))
+        run = run_java_test(path)
+        return run, path
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
 
@@ -621,14 +1078,15 @@ def build_report(filename: str, code: str) -> dict[str, Any]:
         parse_error = str(exc)
 
     test_cases = parsed.get("test_cases") or {}
-    test_run: dict[str, Any] | None = None
 
-    if language == "python" and test_cases:
-        test_file_path = os.path.join(TEST_FOLDER, f"test_{safe_module}.py")
-        test_source = build_pytest_file(safe_module, test_cases, code)
-        with open(test_file_path, "w", encoding="utf-8") as fh:
-            fh.write(test_source)
-        test_run = run_pytest(test_file_path)
+    test_run, test_file_path = _execute_tests(
+        language=language,
+        module_name=safe_module,
+        safe_module=safe_module,
+        code=code,
+        test_cases=test_cases,
+    )
+    if test_run is not None and test_file_path:
         test_run["test_file"] = test_file_path
 
     report_id = uuid.uuid4().hex[:12]
@@ -658,7 +1116,7 @@ def build_report(filename: str, code: str) -> dict[str, Any]:
         "parse_error": parse_error,
         "raw_assistant_text": assistant_text if parse_error else None,
         "code_preview": code[:4000],
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
     REPORTS[report_id] = report
@@ -862,10 +1320,17 @@ def report_to_markdown(report: dict[str, Any]) -> str:
                     lines.append(f"- **Inputs:** `{case['inputs']}`")
                 if case.get("expected"):
                     lines.append(f"- **Expected:** {case['expected']}")
-                if case.get("pytest_code"):
+                snippet = case.get("test_code") or case.get("pytest_code")
+                if snippet:
+                    fence_lang = {
+                        "python": "python",
+                        "javascript": "javascript",
+                        "typescript": "typescript",
+                        "java": "java",
+                    }.get(report.get("language", ""), "")
                     lines.append("")
-                    lines.append("```python")
-                    lines.append(_normalise_pytest_code(case["pytest_code"]))
+                    lines.append("```" + fence_lang)
+                    lines.append(_normalise_pytest_code(snippet))
                     lines.append("```")
                 lines.append("")
 
@@ -1123,6 +1588,8 @@ def export_postman(report_id: str):
 
 @app.route("/health")
 def health():
+    java_bin, java_src = _resolve_bin_with_source(JAVA_BIN_ENV, "java")
+    node_bin, node_src = _resolve_bin_with_source(NODE_BIN_ENV, "node")
     return jsonify(
         {
             "ok": True,
@@ -1130,6 +1597,11 @@ def health():
             and CURSOR_API_KEY != "CURSOR_API_KEY",
             "cursor_repo": CURSOR_REPO_URL,
             "cursor_model": CURSOR_MODEL,
+            "runners": {
+                "python": True,
+                "node": {"available": bool(node_bin), "path": node_bin, "source": node_src},
+                "java": {"available": bool(java_bin), "path": java_bin, "source": java_src},
+            },
         }
     )
 

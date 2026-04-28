@@ -669,7 +669,7 @@
           ${tc.description ? `<div class="desc">${escapeHtml(tc.description)}</div>` : ""}
           ${tc.inputs   ? `<div class="kv"><b>Inputs:</b> <code>${escapeHtml(tc.inputs)}</code></div>` : ""}
           ${tc.expected ? `<div class="kv"><b>Expected:</b> ${escapeHtml(tc.expected)}</div>` : ""}
-          ${tc.pytest_code ? `<details><summary>Show pytest code</summary><pre>${escapeHtml(tc.pytest_code)}</pre></details>` : ""}
+          ${(tc.test_code || tc.pytest_code) ? `<details><summary>Show test code</summary><pre>${escapeHtml(tc.test_code || tc.pytest_code)}</pre></details>` : ""}
         </div>
       `).join("") || `<div class="muted">No ${c} cases generated.</div>`;
       return `<div class="tc-list" data-inner-panel="${c}" style="${i===0?'':'display:none;'}">${cards}</div>`;
@@ -679,7 +679,7 @@
   }
 
   function renderTestRun(run) {
-    if (!run) return `<div class="empty">Tests are only auto-run for Python files.</div>`;
+    if (!run) return `<div class="empty">Tests are auto-run for Python (.py), JavaScript (.js), TypeScript (.ts) and Java (.java). Other languages still get full test plans, just no execution.</div>`;
     if (!run.ran) {
       return `<div class="muted">${escapeHtml(run.error || "Tests were not executed.")}</div>`;
     }
